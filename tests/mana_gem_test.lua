@@ -29,6 +29,9 @@ local SPELLS = {
 }
 
 local LABEL = "Use mana gems"
+local SKIP_CD_LABEL = "Show mana potion when mana gem is on cooldown"
+local SEPARATE_GEM_LABEL = "Separate Mana Gem macro (AutoManaGem)"
+local CELESTIAL_ORB = 7515
 
 local function mage(flavor, bags, options)
   options = options or {}
@@ -145,5 +148,85 @@ for _, flavor in ipairs({ "classic", "forever", "retail" }) do
 
     client:leaveCombat()
     assertEqual(client:macroText("AutoManaPotion"), sequence(items.reset, items.gem, items.potion))
+  end)
+
+  test(flavor .. ": skips a mana gem on cooldown when enabled and returns to it on expiry", function()
+    local client = mage(flavor, { [items.gem] = 1, [items.potion] = 5 }, {
+      itemCooldowns = { [items.gem] = { start = 1, duration = 60 } },
+    })
+    assertEqual(client:macroText("AutoManaPotion"), uses(items.potion))
+
+    client:openSettings("AutoPotion", "AutoManaPotion")
+    assertEqual(client:isChecked(SKIP_CD_LABEL), true)
+    client:clickCheckbox(SKIP_CD_LABEL)
+    client:nextFrame()
+    assertEqual(client:macroText("AutoManaPotion"), sequence(items.reset, items.gem, items.potion))
+
+    client:clickCheckbox(SKIP_CD_LABEL)
+    client:nextFrame()
+    assertEqual(client:macroText("AutoManaPotion"), uses(items.potion))
+
+    client:advance(65)
+    assertEqual(client:macroText("AutoManaPotion"), sequence(items.reset, items.gem, items.potion))
+    assertEqual(client.errors, {})
+  end)
+
+  test(flavor .. ": Separate Mana Gem macro creates AutoManaGem and keeps AutoManaPotion for potions", function()
+    local client = mage(flavor, { [items.gem] = 1, [items.potion] = 5, [items.second] = 5 })
+    client:openSettings("AutoPotion", "AutoManaPotion")
+    assertEqual(client:isChecked(SEPARATE_GEM_LABEL), false)
+    assertEqual(client:macroText("AutoManaGem"), nil)
+
+    client:clickCheckbox(SEPARATE_GEM_LABEL)
+    client:nextFrame()
+    assertEqual(client:macroText("AutoManaGem"), uses(items.gem))
+    assertEqual(client:macroText("AutoManaPotion"), uses(items.potion))
+    assertEqual(previewOf(client), { Api.itemIcon(items.potion), Api.itemIcon(items.second) })
+    assertEqual(client:isEnabled(LABEL), false)
+    assertEqual(client:isEnabled(SKIP_CD_LABEL), false)
+    assertEqual(client.errors, {})
+  end)
+
+  test(flavor .. ": equipped Celestial Orb (7515) sits between mana gem and mana potion and is skipped on CD", function()
+    local client = mage(flavor, { [items.gem] = 1, [items.potion] = 5, [items.second] = 5 }, {
+      equipped = { [17] = CELESTIAL_ORB },
+    })
+    assertEqual(client:macroText("AutoManaPotion"),
+      "#showtooltip\n/castsequence reset=" .. items.reset .. " item:" .. items.gem
+        .. ", item:" .. CELESTIAL_ORB .. ", item:" .. items.potion)
+
+    client:openSettings("AutoPotion", "AutoManaPotion")
+    assertEqual(previewOf(client), {
+      Api.itemIcon(items.gem), Api.itemIcon(CELESTIAL_ORB),
+      Api.itemIcon(items.potion), Api.itemIcon(items.second),
+    })
+
+    -- Gem on CD: advances to Celestial Orb -> Mana Potion with 1800s default reset
+    client:setItemCooldown(items.gem, 60)
+    client:nextFrame()
+    assertEqual(client:macroText("AutoManaPotion"),
+      "#showtooltip\n/castsequence reset=combat/1800 item:" .. CELESTIAL_ORB .. ", item:" .. items.potion)
+
+    -- Orb also on 30m CD: advances directly to Mana Potion
+    client:setItemCooldown(CELESTIAL_ORB, 1800)
+    client:nextFrame()
+    assertEqual(client:macroText("AutoManaPotion"), uses(items.potion))
+
+    -- With skipManaGemOnCooldown off, gem stays first while 30m CD orb is still skipped
+    client:clickCheckbox(SKIP_CD_LABEL)
+    client:nextFrame()
+    assertEqual(client:macroText("AutoManaPotion"), sequence(items.reset, items.gem, items.potion))
+    assertEqual(previewOf(client), {
+      Api.itemIcon(items.gem), Api.itemIcon(items.potion),
+      Api.itemIcon(CELESTIAL_ORB), Api.itemIcon(items.second),
+    })
+
+    -- Unequipping Celestial Orb removes it from preview and macro
+    client:equip({ [17] = false })
+    client:nextFrame()
+    assertEqual(previewOf(client), {
+      Api.itemIcon(items.gem), Api.itemIcon(items.potion), Api.itemIcon(items.second),
+    })
+    assertEqual(client.errors, {})
   end)
 end

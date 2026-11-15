@@ -110,6 +110,9 @@ ham.manaSapphire = ham.Item.new(33312, "Mana Sapphire")
 ham.manaGem = ham.Item.new(36799, "Mana Gem")
 ham.brilliantManaGem = ham.Item.new(81901, "Brilliant Mana Gem")
 
+-- Off-hand mana item (Mage quest reward): 30m cooldown, restores 400-1200 mana.
+ham.celestialOrb = ham.Item.new(7515, "Celestial Orb")
+
 local function getManaGems()
   if ham.isRetail and ham.getManaGemsForRetail then return ham.getManaGemsForRetail() end
   if ham.isClassic and ham.getManaGemsForClassic then return ham.getManaGemsForClassic() end
@@ -121,12 +124,43 @@ local function getManaGems()
   return {}
 end
 
--- The mana gem AutoManaPotion uses: the best one in the bags, nil without one or with
--- "Use mana gems" off. All mana gems share one cooldown, so the macro only ever needs the best.
-function ham.getManaGem()
-  if not ham.options.useManaGems then return nil end
+-- The best mana gem currently in the player's bags, regardless of AutoManaPotion settings.
+function ham.getBestManaGem()
   for _, gem in ipairs(getManaGems()) do
     if gem.getCount() > 0 then return gem end
+  end
+  return nil
+end
+
+-- The mana gem AutoManaPotion uses: the best one in the bags, nil without one, with
+-- "Use mana gems" off, or when mana gems are split into their own AutoManaGem macro.
+function ham.getManaGem()
+  if not ham.options.useManaGems or ham.options.separateManaGemMacro then return nil end
+  return ham.getBestManaGem()
+end
+
+local function isItemEquipped(itemId)
+  if GetInventoryItemID and GetInventoryItemID("player", 17) == itemId then
+    return true
+  end
+  if C_Item and C_Item.IsEquippedItem then
+    return C_Item.IsEquippedItem(itemId)
+  end
+  if IsEquippedItem then
+    return IsEquippedItem(itemId)
+  end
+  return false
+end
+
+-- Celestial Orb only counts when equipped in the off-hand slot.
+ham.celestialOrb.getCount = function()
+  return isItemEquipped(ham.celestialOrb.getId()) and 1 or 0
+end
+
+-- Returns Celestial Orb (item 7515) when currently equipped in the off-hand slot.
+function ham.getCelestialOrb()
+  if isItemEquipped(ham.celestialOrb.getId()) then
+    return ham.celestialOrb
   end
   return nil
 end
@@ -163,4 +197,102 @@ function ham.getManaPotions()
     end
   end
   return filtered
+end
+
+local function usable(value)
+  return not (issecretvalue and issecretvalue(value))
+end
+
+local function rawItemCooldown(itemId)
+  if C_Item and C_Item.GetItemCooldown then
+    return C_Item.GetItemCooldown(itemId)
+  end
+  if C_Container and C_Container.GetItemCooldown then
+    return C_Container.GetItemCooldown(itemId)
+  end
+  if GetItemCooldown then
+    return GetItemCooldown(itemId)
+  end
+  return 0, 0, 0
+end
+
+-- Remaining cooldown in seconds for itemId, ignoring the 1.5s GCD and secret values.
+function ham.getItemCooldownRemaining(itemId)
+  if not itemId then return 0 end
+  local start, duration, enable = rawItemCooldown(itemId)
+  if not usable(start) or not usable(duration) or not usable(enable) then
+    return 0
+  end
+  if enable == 0 or not start or start <= 0 or not duration or duration <= 1.5 then
+    return 0
+  end
+  local remaining = (start + duration) - GetTime()
+  if remaining > 0.05 then
+    return remaining
+  end
+  return 0
+end
+
+-- Returns (activePreItems, minExpiry, skippedPreItems): decides which pre-potion items
+-- (mana gem and equipped Celestial Orb) belong ahead of the mana potion `pot`.
+-- `gem` is skipped only when skipManaGemOnCooldown is enabled and a later item (`orb` or
+-- `pot`) is ready sooner. `orb` (30m CD) is always skipped when on cooldown and `pot` (or
+-- a sooner `gem` when no `pot` exists) is ready first so its 30m CD never blocks potions.
+function ham.getActiveManaSequence(gem, orb, pot)
+  local activePre = {}
+  local skippedPre = {}
+  local minExpiry = nil
+
+  local function trackExpiry(delay)
+    if delay and delay > 0 and (not minExpiry or delay < minExpiry) then
+      minExpiry = delay
+    end
+  end
+
+  local gemRem = gem and ham.getItemCooldownRemaining(gem.getId()) or nil
+  local orbRem = orb and ham.getItemCooldownRemaining(orb.getId()) or nil
+  local potRem = pot and ham.getItemCooldownRemaining(pot.getId()) or nil
+
+  local allowSkipGem = ham.options and ham.options.useManaGems and ham.options.skipManaGemOnCooldown
+  local skipGem = false
+  if gem then
+    local afterGemMin = orbRem
+    if potRem and (not afterGemMin or potRem < afterGemMin) then
+      afterGemMin = potRem
+    end
+    if allowSkipGem and gemRem > 0 and afterGemMin and afterGemMin < gemRem then
+      skipGem = true
+      table.insert(skippedPre, gem)
+    else
+      table.insert(activePre, gem)
+    end
+    if allowSkipGem and gemRem > 0 then
+      trackExpiry(gemRem)
+    end
+  end
+
+  if orb then
+    local soonerAfterOrb = potRem and potRem < orbRem
+    local gemCoversWhenNoPot = (not pot) and gem and (not skipGem) and (gemRem < orbRem)
+    if orbRem > 0 and (soonerAfterOrb or gemCoversWhenNoPot) then
+      table.insert(skippedPre, orb)
+    else
+      table.insert(activePre, orb)
+    end
+    if orbRem > 0 and (soonerAfterOrb or gemCoversWhenNoPot or pot ~= nil) then
+      trackExpiry(orbRem)
+    end
+  end
+
+  return activePre, minExpiry, skippedPre
+end
+
+-- Returns (skipGem, refreshDelay): whether the macro should show/use the mana potion
+-- ahead of the mana gem because the gem is on cooldown and the potion is ready sooner.
+function ham.shouldPutManaPotionBeforeGem(gem, pot)
+  if not gem or not pot then
+    return false, nil
+  end
+  local activePre, expiry = ham.getActiveManaSequence(gem, nil, pot)
+  return #activePre == 0, expiry
 end
